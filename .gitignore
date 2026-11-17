@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地环境/密钥(实例地址与令牌只走环境变量)
+.env
+.env.*
+*.local
+
+# 工具索引与本地状态
+.codegraph/
+.unipi/
+.pi/
+.cache/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp

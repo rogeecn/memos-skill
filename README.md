@@ -7,7 +7,7 @@
 memos-skill/
 ├── SKILL.md                 # skill 入口:触发词、命令、工作流
 ├── scripts/memos.py         # 纯 stdlib CLI:ping/publish/list/search/get/update/delete/forget/attach/tags
-├── references/memos-api.md  # 实测 REST API(v0.30)记录
+├── references/memos-api.md  # 实测 REST API(v26)记录
 └── README.md
 ```
 
@@ -19,6 +19,10 @@ memos-skill/
 | `MEMOS_API_KEY` | ✅ | 访问令牌(Memos → 设置 → 访问令牌),`Bearer` 认证 |
 | `MEMOS_DEFAULT_VISIBILITY` | – | 默认 `private` |
 | `MEMOS_API_TIMEOUT` | – | 默认 20 秒 |
+| `MEMOS_ENV_FILE` | – | 额外读取的环境文件;默认还会尝试 `~/.zshenv` / `~/.profile` / `~/.bashrc` |
+
+> 脚本走 Memos **v26 REST API**(`/api/memos`);旧的 `/api/v1/...` 已被服务端移除(HTTP 410)。
+> 环境变量缺失时脚本会自动从上述 shell 配置文件按行补读(不执行 shell),适配读不到 `~/.zshenv` 的 agent runtime。
 
 ## 快速开始
 

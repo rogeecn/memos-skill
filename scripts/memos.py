@@ -9,6 +9,9 @@
 
 子命令：ping / publish / list / search / get / update / delete / forget / attach / tags
 用法见 SKILL.md 或 `python3 memos.py <cmd> -h`。
+
+接口：Memos v26 系列 REST API（`/api/memos`、`/api/attachments`、`/api/instance/profile`）。
+旧的 `/api/v1/...`（gRPC-gateway）已被服务端移除，返回 HTTP 410。
 """
 
 from __future__ import annotations
@@ -31,13 +34,64 @@ VISIBILITIES = {
     "public": "PUBLIC",
 }
 _NAME_RE = re.compile(r"^memos/(.+)$")
+_STATE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
 
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 
 
+def _unquote_shell(value: str) -> str:
+    """去掉 shell 赋值里的成对引号与行尾注释。"""
+    v = value.strip()
+    if v[:1] in ("'", '"'):
+        quote = v[0]
+        end = v.find(quote, 1)
+        if end > 0:
+            return v[1:end]
+    return re.sub(r"\s+#.*$", "", v).strip()
+
+
+def load_env_fallback(keys=("MEMOS_URL", "MEMOS_API_KEY")):
+    """从 shell 配置文件补全缺失的 MEMOS_* 环境变量。
+
+    非交互 shell（agent/pi runtime）常常读不到 ~/.zshenv 里的 export。
+    这里只按行解析 `KEY=VALUE` / `export KEY=VALUE`，不执行任何 shell 代码，
+    并且只在进程环境里缺失时才填充。可用 MEMOS_ENV_FILE 指定额外文件。
+    """
+    if all(os.environ.get(k) for k in keys):
+        return
+    candidates = [
+        os.environ.get("MEMOS_ENV_FILE", ""),
+        os.path.expanduser("~/.zshenv"),
+        os.path.expanduser("~/.profile"),
+        os.path.expanduser("~/.bashrc"),
+    ]
+    seen = set()
+    for path in candidates:
+        if not path or path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = _STATE_RE.match(line.strip())
+                    if not m:
+                        continue
+                    name, raw = m.group(1), m.group(2)
+                    if name in keys and not os.environ.get(name):
+                        value = _unquote_shell(raw)
+                        if value:
+                            os.environ[name] = value
+        except OSError:
+            continue
+        if all(os.environ.get(k) for k in keys):
+            return
+
+
 class Config:
     def __init__(self, url: str = "", key: str = ""):
+        if not url or not key:
+            load_env_fallback()
         self.url = (url or os.environ.get("MEMOS_URL", "")).strip().rstrip("/")
         self.key = (key or os.environ.get("MEMOS_API_KEY", "")).strip()
         self.timeout = float(os.environ.get("MEMOS_API_TIMEOUT", "20") or 20)
@@ -50,9 +104,10 @@ class Config:
         if missing:
             fail(
                 "缺少环境变量：%s\n"
-                "  在 shell profile 或 ~/.hermes/.env 中设置：\n"
+                "  在 ~/.zshenv（或 shell profile）中设置并 source，或本次用 --url/--key 覆盖：\n"
                 "    export MEMOS_URL=https://<你的实例地址>\n"
-                "    export MEMOS_API_KEY=<访问令牌>   # Memos → 设置 → 访问令牌"
+                "    export MEMOS_API_KEY=<访问令牌>   # Memos → 设置 → 访问令牌\n"
+                "  脚本会自动尝试从 ~/.zshenv / ~/.profile / ~/.bashrc 补读这两个变量。"
                 % "、".join(missing)
             )
         return self
@@ -101,24 +156,27 @@ class Client:
                 detail = e.read().decode("utf-8", "replace")[:500]
             except Exception:
                 pass
-            raise RuntimeError(f"HTTP {e.code} {method} {path}: {detail or e.reason}") from e
+            hint = ""
+            if e.code == 410:
+                hint = "  （服务端已移除 /api/v1，只支持 /api/... REST 接口；请升级 memos skill）"
+            raise RuntimeError(f"HTTP {e.code} {method} {path}: {detail or e.reason}{hint}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"网络错误 {self.cfg.url}{path}: {e.reason}") from e
         except json.JSONDecodeError:
             raise RuntimeError(f"响应不是合法 JSON: {method} {path}")
 
     def create_memo(self, content: str, visibility: str) -> dict:
-        return self._request("POST", "/api/v1/memos", {"content": content, "visibility": visibility})
+        return self._request("POST", "/api/memos", {"content": content, "visibility": visibility})
 
-    def patch_memo(self, memo_id: str, body: dict, mask: str) -> dict:
-        q = urllib.parse.urlencode({"updateMask": mask})
-        return self._request("PATCH", f"/api/v1/memos/{memo_id}?{q}", body)
+    def patch_memo(self, memo_id: str, body: dict) -> dict:
+        # v26 REST 的 PATCH 是部分更新：只改 body 里出现的字段，不需要 updateMask。
+        return self._request("PATCH", f"/api/memos/{memo_id}", body)
 
     def get_memo(self, memo_id: str) -> dict:
-        return self._request("GET", f"/api/v1/memos/{memo_id}")
+        return self._request("GET", f"/api/memos/{memo_id}")
 
     def delete_memo(self, memo_id: str) -> dict:
-        return self._request("DELETE", f"/api/v1/memos/{memo_id}")
+        return self._request("DELETE", f"/api/memos/{memo_id}")
 
     def list_memos(self, *, page_size=50, page_token="", filter="", order_by="", state=""):
         params = {"pageSize": str(page_size)}
@@ -130,7 +188,7 @@ class Client:
             params["orderBy"] = order_by
         if state:
             params["state"] = state
-        return self._request("GET", "/api/v1/memos?" + urllib.parse.urlencode(params))
+        return self._request("GET", "/api/memos?" + urllib.parse.urlencode(params))
 
     def create_attachment(self, filename: str, mime: str, data: bytes, memo_name: str = "") -> dict:
         body = {
@@ -140,10 +198,10 @@ class Client:
         }
         if memo_name:
             body["memo"] = memo_name
-        return self._request("POST", "/api/v1/attachments", body)
+        return self._request("POST", "/api/attachments", body)
 
     def profile(self) -> dict:
-        return self._request("GET", "/api/v1/instance/profile")
+        return self._request("GET", "/api/instance/profile")
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -291,7 +349,7 @@ def cmd_publish(args, cfg: Config, cli: Client):
 
     memo = cli.create_memo(content, visibility)
     if args.pin and not memo.get("pinned"):
-        memo = cli.patch_memo(memo_id(memo_name(memo)), {"pinned": True}, "pinned")
+        memo = cli.patch_memo(memo_id(memo_name(memo)), {"pinned": True})
 
     attachments = []
     for path in args.attach or []:
@@ -345,8 +403,6 @@ def build_filter(args) -> str:
         parts.append(" && ".join(f'"{t}" in tags' for t in tags))
     if getattr(args, "visibility", None):
         parts.append(f'visibility == "{normalize_visibility(args.visibility, "private")}"')
-    if getattr(args, "state", None):
-        parts.append(f'state == "{args.state.upper()}"')
     if getattr(args, "pinned", False):
         parts.append("pinned == true")
     return " && ".join(parts)
@@ -368,8 +424,11 @@ def collect(cli: Client, filter_str: str, limit: int, order_by: str, state: str 
 
 
 def cmd_list(args, cfg: Config, cli: Client):
-    memos = collect(cli, build_filter(args), args.limit, args.order,
-                    state="" if args.state else "NORMAL")
+    # v26 的 state 只能走 query 参数（CEL 里没有 state 变量）；all = 不传。
+    state = (args.state or "NORMAL").strip().upper()
+    if state == "ALL":
+        state = ""
+    memos = collect(cli, build_filter(args), args.limit, args.order, state=state)
     if args.json:
         print_json({"count": len(memos), "memos": memos})
         return
@@ -445,7 +504,7 @@ def cmd_update(args, cfg: Config, cli: Client):
         mask.append("pinned")
     if not mask:
         fail("没有要更新的字段（--content/--file/--tag/--visibility/--pin/--unpin）")
-    memo = cli.patch_memo(mid, body, ",".join(mask))
+    memo = cli.patch_memo(mid, body)
     if args.json:
         print_json(memo)
     else:
@@ -546,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", "-n", type=int, default=20)
     sp.add_argument("--tag", "-g", action="append", default=[])
     sp.add_argument("--visibility", "-v", default="")
-    sp.add_argument("--state", default="", help="NORMAL（默认）| ARCHIVED")
+    sp.add_argument("--state", default="", help="NORMAL（默认）| ARCHIVED | all")
     sp.add_argument("--filter", default="", help="原生 CEL 过滤条件，如 content.contains(\"x\")")
     sp.add_argument("--order", default="create_time desc")
     sp.add_argument("--full", action="store_true", help="打印完整正文")
